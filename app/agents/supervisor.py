@@ -1,8 +1,20 @@
 import json
-from app.llm import call_llm
+from app.llm import call_llm, current_task_id, current_node
+from app.observability.tracer import tracer
 
 
 def supervisor_node(state):
+    task_id = state.get("task_id", "")
+    current_task_id.set(task_id)
+    current_node.set("supervisor")
+    tracer.node_enter(task_id, "supervisor", input_keys=["original_request"])
+
+    is_rework = state.get("review_result", {}).get("requires_rework", False)
+    rework_count = state.get("rework_count", 0)
+
+    if is_rework:
+        rework_count += 1
+
     system_prompt = """
 You are the Supervisor Agent in a multi-agent orchestration system.
 
@@ -33,10 +45,22 @@ JSON schema:
 }
 """
 
+    rework_context = ""
+    if is_rework:
+        rework_context = f"""
+This is a rework pass. Previous reviewer feedback:
+{state.get("review_result", {})}
+
+Previous agent outputs:
+{state.get("agent_outputs", {})}
+
+Create an improved execution plan addressing the feedback.
+"""
+
     user_prompt = f"""
 Original user request:
 {state["original_request"]}
-
+{rework_context}
 Create an execution plan.
 """
 
@@ -61,7 +85,11 @@ Create an execution plan.
             ]
         }
 
+    tracer.node_exit(task_id, "supervisor", output_keys=["execution_plan"])
+
     return {
         "execution_plan": plan,
-        "current_subtask_index": 0
+        "current_subtask_index": 0,
+        "agent_outputs": {},
+        "rework_count": rework_count,
     }

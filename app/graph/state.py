@@ -1,4 +1,8 @@
-from typing import TypedDict, Dict, Any, List, Optional
+from typing import Annotated, Any, Dict, List, Optional, TypedDict
+
+
+def append_lists(left: List[Dict[str, Any]], right: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return left + right
 
 
 class AgentState(TypedDict):
@@ -13,4 +17,11 @@ class AgentState(TypedDict):
     review_result: Dict[str, Any]
 
     final_output: Optional[str]
-    errors: List[Dict[str, Any]]
+    errors: Annotated[List[Dict[str, Any]], append_lists]
+    rework_count: int
+
+    # Human-in-the-loop fields
+    escalation_required: bool
+    escalation_reason: str
+    human_decision: Optional[str]   # "approve" | "reject" | None
+    human_feedback: str
