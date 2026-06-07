@@ -4,6 +4,7 @@ from typing import Any, Dict
 import app.tools  # ensure tools are registered
 from app.tools.registry import registry, tool_log
 from app.llm import call_llm, current_task_id, current_node
+from app.human_review import detect_sensitive_operations, determine_approval_level
 from app.observability.tracer import tracer
 
 AGENT_ROLES = {
@@ -22,6 +23,7 @@ AGENT_ROLES = {
 }
 
 MAX_TOOL_ROUNDS = 5
+MAX_SUBTASK_FAILURES = 2   # escalate after this many failures on the same subtask
 
 
 def _build_tool_selection_prompt(agent_name: str, subtask: Dict, available_tools: list, prior_outputs: Dict) -> str:
@@ -100,7 +102,31 @@ def run_specialist_node(state: Dict[str, Any], agent_name: str) -> Dict[str, Any
     current_node.set(agent_name)
     tracer.node_enter(task_id, agent_name, input_keys=["subtask", "prior_outputs"])
 
-    # --- Tool use loop ---
+    # ── Sensitive operation detection ──────────────────────────────────────────
+    subtask_text = f"{subtask.get('description', '')} {subtask.get('expected_output', '')}"
+    sensitive_ops = detect_sensitive_operations(subtask_text)
+
+    if sensitive_ops:
+        level, reason = determine_approval_level(sensitive_ops=sensitive_ops)
+        tracer.node_exit(task_id, agent_name)
+        return {
+            "escalation_required": True,
+            "escalation_reason": reason,
+            "approval_level": level,
+        }
+
+    # ── Failure count check ────────────────────────────────────────────────────
+    failure_counts: Dict[str, int] = dict(state.get("subtask_failure_counts", {}))
+    if failure_counts.get(subtask_id, 0) >= MAX_SUBTASK_FAILURES:
+        level, reason = determine_approval_level(specialist_failure_count=failure_counts[subtask_id])
+        tracer.node_exit(task_id, agent_name)
+        return {
+            "escalation_required": True,
+            "escalation_reason": reason,
+            "approval_level": level,
+        }
+
+    # ── Tool use loop ──────────────────────────────────────────────────────────
     tool_results = []
     tools_used = []
 
@@ -130,9 +156,9 @@ def run_specialist_node(state: Dict[str, Any], agent_name: str) -> Dict[str, Any
             tools_used.append(tool_name)
 
         if not result.get("success"):
-            break  # don't keep calling if the tool failed
+            break
 
-    # --- Final synthesis ---
+    # ── Final synthesis ────────────────────────────────────────────────────────
     system_prompt, user_prompt = _build_final_output_prompt(
         agent_name, role_prompt, subtask, prior_outputs, tool_results
     )
@@ -154,10 +180,16 @@ def run_specialist_node(state: Dict[str, Any], agent_name: str) -> Dict[str, Any
             "errors": errors,
         }
 
+    # ── Track failures for next attempt ───────────────────────────────────────
+    if errors or output.get("errors"):
+        failure_counts[subtask_id] = failure_counts.get(subtask_id, 0) + 1
+    else:
+        failure_counts.pop(subtask_id, None)  # clear on success
+
     output["tools_used"] = tools_used
     output["tool_invocation_logs"] = tool_log.get_logs()
 
-    # trace tool calls recorded by the registry
+    # Trace tool calls
     for log_entry in tool_log.get_logs():
         tracer.tool_call(
             task_id=task_id,
@@ -177,5 +209,6 @@ def run_specialist_node(state: Dict[str, Any], agent_name: str) -> Dict[str, Any
     return {
         "agent_outputs": prior_outputs,
         "current_subtask_index": idx + 1,
+        "subtask_failure_counts": failure_counts,
         "errors": [{"agent": agent_name, "subtask_id": subtask_id, "error": e} for e in errors],
     }

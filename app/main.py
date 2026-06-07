@@ -4,7 +4,10 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from app.graph.workflow import build_graph
-from app.human_review import get_pending, list_pending, resolve
+from app.human_review import (
+    add_chat_message, get_chat, get_pending,
+    list_all, list_pending, resolve,
+)
 from app.memory import long_term, short_term
 from app.memory.manager import consolidate_user_memories, expire_stale_memories
 from app.observability.tracer import tracer
@@ -53,8 +56,10 @@ def run_task(task: TaskRequest):
         # Human-in-the-loop defaults
         "escalation_required": False,
         "escalation_reason": "",
+        "approval_level": "notify",
         "human_decision": None,
         "human_feedback": "",
+        "subtask_failure_counts": {},
         # Memory defaults
         "retrieved_memories": [],
         "saved_memory_ids": [],
@@ -88,9 +93,17 @@ def get_pending_review(task_id: str):
     return entry
 
 
+@app.get("/tasks/all")
+def list_all_reviews():
+    """List all review entries (pending + resolved)."""
+    return {"reviews": list_all()}
+
+
 class ReviewDecision(BaseModel):
-    decision: str   # "approve" or "reject"
+    decision: str          # approve | reject | modify | take_over
     feedback: str = ""
+    modified_plan: dict = None   # for "modify" decision
+    human_output: str = None     # for "take_over" decision
 
 
 @app.post("/tasks/{task_id}/review")
@@ -98,23 +111,49 @@ def submit_review(task_id: str, body: ReviewDecision):
     """
     Submit a human review decision for an escalated task.
 
-    - decision: "approve" → the task continues to specialist execution
-    - decision: "reject"  → the supervisor re-plans using your feedback
-    - feedback: optional explanation (required for reject to be useful)
+    - approve    → task continues as planned
+    - reject     → supervisor re-plans using feedback
+    - modify     → reviewer edits the plan; pass modified_plan in body
+    - take_over  → human provides the final output directly; pass human_output in body
     """
-    if body.decision not in ("approve", "reject"):
-        raise HTTPException(status_code=400, detail="decision must be 'approve' or 'reject'")
+    valid = {"approve", "reject", "modify", "take_over"}
+    if body.decision not in valid:
+        raise HTTPException(status_code=400, detail=f"decision must be one of {valid}")
 
-    ok = resolve(task_id, body.decision, body.feedback)
+    ok = resolve(
+        task_id,
+        body.decision,
+        feedback=body.feedback,
+        modified_plan=body.modified_plan,
+        human_output=body.human_output,
+    )
     if not ok:
         raise HTTPException(status_code=404, detail=f"No pending review found for task '{task_id}'")
 
     return {
         "task_id": task_id,
         "decision": body.decision,
-        "feedback": body.feedback,
         "status": "resolved — task will resume shortly",
     }
+
+
+class ChatMessage(BaseModel):
+    message: str
+
+
+@app.post("/tasks/{task_id}/chat")
+def send_chat(task_id: str, body: ChatMessage):
+    """Send a question to the AI about an escalated task. The agent will reply."""
+    ok = add_chat_message(task_id, "human", body.message)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"No review found for task '{task_id}'")
+    return {"status": "message sent — agent will reply shortly"}
+
+
+@app.get("/tasks/{task_id}/chat")
+def get_chat_history(task_id: str):
+    """Get the full chat thread for a review."""
+    return {"task_id": task_id, "chat": get_chat(task_id)}
 
 
 # ─── Observability endpoints ───────────────────────────────────────────────────

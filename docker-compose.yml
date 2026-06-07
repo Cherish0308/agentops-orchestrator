@@ -55,6 +55,20 @@ services:
       - ./workspace:/app/workspace
     command: uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload
 
+  # ── Streamlit Review UI ───────────────────────────────────────────────────
+  review_ui:
+    build: .
+    container_name: agentops_review_ui
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    environment:
+      - AGENTOPS_API_URL=http://api:8080
+    depends_on:
+      - api
+    command: streamlit run review_ui/app.py --server.port 8501 --server.address 0.0.0.0
+
 volumes:
   redis_data:
   chroma_data:

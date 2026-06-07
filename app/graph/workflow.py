@@ -8,6 +8,7 @@ from app.agents.supervisor import supervisor_node
 from app.agents.synthesizer import synthesizer_node
 from app.agents.writer import writer_agent_node
 from app.graph.state import AgentState
+from app.human_review import APPROVE_PLAN, NOTIFY, determine_approval_level
 
 SPECIALIST_NODES = {
     "research_agent": "research_agent",
@@ -16,29 +17,40 @@ SPECIALIST_NODES = {
 }
 
 CONFIDENCE_THRESHOLD = 0.6
-HIGH_RISK_LEVELS = {"high"}
+QUALITY_THRESHOLD = 0.5
 
+
+# ── Routing functions ──────────────────────────────────────────────────────────
 
 def route_after_supervisor(state: AgentState) -> str:
     """
-    After the supervisor produces a plan, decide:
-    - escalate to human if confidence is low or risk is high
-    - otherwise proceed to the first specialist
+    Triggers: low confidence, high risk, or user explicitly requested review.
     """
+    # Check if a specialist already flagged escalation (sensitive ops / failures)
+    if state.get("escalation_required"):
+        return "human_escalation"
+
     plan = state.get("execution_plan", {})
     confidence = plan.get("confidence_score", 1.0)
     risk = plan.get("risk_level", "low")
+    user_requested = state.get("original_request", "").lower().strip().startswith("review:")
 
-    needs_escalation = (confidence < CONFIDENCE_THRESHOLD) or (risk in HIGH_RISK_LEVELS)
+    level, reason = determine_approval_level(
+        confidence_score=confidence,
+        risk_level=risk,
+        user_requested=user_requested,
+        confidence_threshold=CONFIDENCE_THRESHOLD,
+    )
 
-    if needs_escalation:
-        reason = (
-            f"Confidence score {confidence:.2f} is below threshold {CONFIDENCE_THRESHOLD}."
-            if confidence < CONFIDENCE_THRESHOLD
-            else f"Risk level '{risk}' requires human approval."
-        )
+    needs_pause = level in (APPROVE_PLAN,)
+
+    if needs_pause or level != NOTIFY:
         state["escalation_required"] = True
         state["escalation_reason"] = reason
+        state["approval_level"] = level
+        if level == NOTIFY:
+            # still route to escalation node but it will immediately pass through
+            return "human_escalation"
         return "human_escalation"
 
     return route_to_specialist(state)
@@ -46,17 +58,24 @@ def route_after_supervisor(state: AgentState) -> str:
 
 def route_after_escalation(state: AgentState) -> str:
     """
-    After a human reviews:
-    - approve → proceed to first specialist
-    - reject  → back to supervisor with feedback
+    approve / modify → proceed to specialists
+    take_over        → skip to synthesizer (human provided the output)
+    reject           → back to supervisor to re-plan
     """
     decision = state.get("human_decision")
-    if decision == "approve":
+
+    if decision == "take_over":
+        return "synthesizer"
+    if decision in ("approve", "modify"):
         return route_to_specialist(state)
     return "supervisor"
 
 
 def route_to_specialist(state: AgentState) -> str:
+    # If a specialist set escalation_required mid-run, intercept
+    if state.get("escalation_required"):
+        return "human_escalation"
+
     subtasks = state.get("execution_plan", {}).get("subtasks", [])
     idx = state.get("current_subtask_index", 0)
 
@@ -68,14 +87,30 @@ def route_to_specialist(state: AgentState) -> str:
 
 
 def route_after_reviewer(state: AgentState) -> str:
-    requires_rework = state.get("review_result", {}).get("requires_rework", False)
+    """
+    Triggers: low quality score → escalate for approve_action.
+    Otherwise: rework once if reviewer rejected, then synthesize.
+    """
+    review = state.get("review_result", {})
+    quality_score = review.get("quality_score", 1.0)
+    requires_rework = review.get("requires_rework", False)
     rework_count = state.get("rework_count", 0)
+
+    # Escalate if quality is too low
+    if quality_score < QUALITY_THRESHOLD:
+        level, reason = determine_approval_level(quality_score=quality_score)
+        state["escalation_required"] = True
+        state["escalation_reason"] = reason
+        state["approval_level"] = level
+        return "human_escalation"
 
     if requires_rework and rework_count < 1:
         return "supervisor"
 
     return "synthesizer"
 
+
+# ── Graph construction ─────────────────────────────────────────────────────────
 
 def build_graph():
     graph = StateGraph(AgentState)
@@ -90,7 +125,6 @@ def build_graph():
 
     graph.set_entry_point("supervisor")
 
-    # Supervisor → escalation or specialist
     graph.add_conditional_edges(
         "supervisor",
         route_after_supervisor,
@@ -103,7 +137,6 @@ def build_graph():
         },
     )
 
-    # Escalation → specialist (approved) or supervisor (rejected)
     graph.add_conditional_edges(
         "human_escalation",
         route_after_escalation,
@@ -113,15 +146,16 @@ def build_graph():
             "writer_agent": "writer_agent",
             "reviewer": "reviewer",
             "supervisor": "supervisor",
+            "synthesizer": "synthesizer",
         },
     )
 
-    # Each specialist → next specialist or reviewer
     for specialist in SPECIALIST_NODES.values():
         graph.add_conditional_edges(
             specialist,
             route_to_specialist,
             {
+                "human_escalation": "human_escalation",
                 "research_agent": "research_agent",
                 "data_agent": "data_agent",
                 "writer_agent": "writer_agent",
@@ -129,11 +163,11 @@ def build_graph():
             },
         )
 
-    # Reviewer → rework (supervisor) or synthesizer
     graph.add_conditional_edges(
         "reviewer",
         route_after_reviewer,
         {
+            "human_escalation": "human_escalation",
             "supervisor": "supervisor",
             "synthesizer": "synthesizer",
         },

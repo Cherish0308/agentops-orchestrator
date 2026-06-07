@@ -23,9 +23,11 @@ class AgentState(TypedDict):
     # Human-in-the-loop fields
     escalation_required: bool
     escalation_reason: str
-    human_decision: Optional[str]   # "approve" | "reject" | None
+    approval_level: str                # notify | approve_action | approve_plan | take_over
+    human_decision: Optional[str]      # approve | reject | modify | take_over
     human_feedback: str
+    subtask_failure_counts: Dict[str, int]   # subtask_id → failure count
 
     # Memory fields
-    retrieved_memories: List[Dict[str, Any]]   # injected into supervisor planning
-    saved_memory_ids: List[str]                # IDs of memories saved after task
+    retrieved_memories: List[Dict[str, Any]]
+    saved_memory_ids: List[str]

@@ -7,3 +7,5 @@ openai
 duckduckgo-search
 redis
 chromadb
+streamlit
+requests
