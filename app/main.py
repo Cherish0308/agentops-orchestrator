@@ -5,13 +5,15 @@ from pydantic import BaseModel
 
 from app.graph.workflow import build_graph
 from app.human_review import get_pending, list_pending, resolve
+from app.memory import long_term, short_term
+from app.memory.manager import consolidate_user_memories, expire_stale_memories
 from app.observability.tracer import tracer
 from app.schemas import TaskRequest, TaskRunResponse
 
 app = FastAPI(
     title="AgentOps Orchestrator",
-    description="Multi-agent orchestration system with supervisor, specialist agents, reviewer, human-in-the-loop escalation, and trace-ready execution.",
-    version="0.2.0"
+    description="Multi-agent orchestration with tool use, persistent memory, human-in-the-loop escalation, and full observability.",
+    version="0.3.0"
 )
 
 workflow = build_graph()
@@ -21,7 +23,14 @@ workflow = build_graph()
 
 @app.get("/")
 def health_check():
-    return {"status": "ok", "service": "AgentOps Orchestrator"}
+    return {
+        "status": "ok",
+        "service": "AgentOps Orchestrator",
+        "memory": {
+            "short_term_redis": short_term.is_available(),
+            "long_term_chromadb": long_term.is_available(),
+        },
+    }
 
 
 # ─── Task execution ────────────────────────────────────────────────────────────
@@ -46,6 +55,9 @@ def run_task(task: TaskRequest):
         "escalation_reason": "",
         "human_decision": None,
         "human_feedback": "",
+        # Memory defaults
+        "retrieved_memories": [],
+        "saved_memory_ids": [],
     }
 
     result = workflow.invoke(initial_state)
@@ -129,3 +141,56 @@ def get_timeline(task_id: str):
     if not timeline.get("total_events"):
         raise HTTPException(status_code=404, detail=f"No trace found for task '{task_id}'")
     return timeline
+
+
+# ─── Memory dashboard endpoints ────────────────────────────────────────────────
+
+@app.get("/memory/{user_id}")
+def get_user_memory(user_id: str):
+    """Memory dashboard — show everything the system remembers about a user."""
+    memories = long_term.get_user_memories(user_id)
+    by_type: dict = {}
+    for m in memories:
+        t = m.get("type", "unknown")
+        by_type.setdefault(t, []).append({
+            "id": m["id"],
+            "content": m["content"],
+            "importance_score": m.get("importance_score"),
+            "access_count": m.get("access_count"),
+            "created_at": m.get("created_at"),
+        })
+    return {
+        "user_id": user_id,
+        "total_memories": len(memories),
+        "by_type": by_type,
+    }
+
+
+@app.delete("/memory/{user_id}")
+def delete_user_memory(user_id: str):
+    """GDPR-style: delete ALL memories for a user."""
+    count = long_term.delete_user_memories(user_id)
+    return {"user_id": user_id, "deleted": count}
+
+
+@app.delete("/memory/{user_id}/{memory_id}")
+def delete_single_memory(user_id: str, memory_id: str):
+    """Delete a single memory entry."""
+    ok = long_term.delete_memory(memory_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"Memory '{memory_id}' not found")
+    return {"deleted": memory_id}
+
+
+@app.post("/memory/{user_id}/consolidate")
+def consolidate_memories(user_id: str):
+    """Merge near-duplicate memories into summaries to keep the store clean."""
+    removed = consolidate_user_memories(user_id)
+    return {"user_id": user_id, "memories_consolidated": removed}
+
+
+@app.post("/memory/{user_id}/expire")
+def expire_memories(user_id: str):
+    """Manually trigger expiry of stale / low-importance memories."""
+    removed = expire_stale_memories(user_id)
+    return {"user_id": user_id, "memories_expired": removed}

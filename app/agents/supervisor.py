@@ -1,5 +1,7 @@
 import json
 from app.llm import call_llm, current_task_id, current_node
+from app.memory.manager import retrieve_for_planning
+from app.memory import short_term
 from app.observability.tracer import tracer
 
 
@@ -57,9 +59,22 @@ Previous agent outputs:
 Create an improved execution plan addressing the feedback.
 """
 
+    # Query long-term memory for similar past tasks
+    memory_context = ""
+    if not is_rework:
+        memory_context = retrieve_for_planning(
+            user_id=state.get("user_id", "anonymous"),
+            request=state["original_request"],
+        )
+
+    # Store the request in short-term working memory
+    short_term.write(state.get("task_id", ""), "original_request", state["original_request"])
+
     user_prompt = f"""
 Original user request:
 {state["original_request"]}
+
+{memory_context}
 {rework_context}
 Create an execution plan.
 """

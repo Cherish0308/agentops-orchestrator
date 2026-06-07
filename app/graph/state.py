@@ -25,3 +25,7 @@ class AgentState(TypedDict):
     escalation_reason: str
     human_decision: Optional[str]   # "approve" | "reject" | None
     human_feedback: str
+
+    # Memory fields
+    retrieved_memories: List[Dict[str, Any]]   # injected into supervisor planning
+    saved_memory_ids: List[str]                # IDs of memories saved after task

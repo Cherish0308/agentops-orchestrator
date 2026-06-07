@@ -5,3 +5,5 @@ python-dotenv
 langgraph
 openai
 duckduckgo-search
+redis
+chromadb
