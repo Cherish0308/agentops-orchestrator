@@ -4,8 +4,12 @@ pydantic
 python-dotenv
 langgraph
 openai
+anthropic
 duckduckgo-search
 redis
 chromadb
 streamlit
 requests
+celery
+sqlalchemy
+psycopg2-binary

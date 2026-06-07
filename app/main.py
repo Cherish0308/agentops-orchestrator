@@ -3,11 +3,14 @@ from uuid import uuid4
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+from app import db
+from app.celery_app import celery, run_task_async
 from app.graph.workflow import build_graph
 from app.human_review import (
     add_chat_message, get_chat, get_pending,
     list_all, list_pending, resolve,
 )
+from app.llm import get_routing_table
 from app.memory import long_term, short_term
 from app.memory.manager import consolidate_user_memories, expire_stale_memories
 from app.observability.tracer import tracer
@@ -15,8 +18,8 @@ from app.schemas import TaskRequest, TaskRunResponse
 
 app = FastAPI(
     title="AgentOps Orchestrator",
-    description="Multi-agent orchestration with tool use, persistent memory, human-in-the-loop escalation, and full observability.",
-    version="0.3.0"
+    description="Multi-agent orchestration with multi-model LLM routing, tool use, persistent memory, human-in-the-loop escalation, async task queue, and full observability.",
+    version="0.4.0"
 )
 
 workflow = build_graph()
@@ -29,10 +32,13 @@ def health_check():
     return {
         "status": "ok",
         "service": "AgentOps Orchestrator",
-        "memory": {
-            "short_term_redis": short_term.is_available(),
-            "long_term_chromadb": long_term.is_available(),
+        "version": "0.4.0",
+        "infrastructure": {
+            "redis": short_term.is_available(),
+            "chromadb": long_term.is_available(),
+            "postgres": db.is_available(),
         },
+        "llm_routing": get_routing_table(),
     }
 
 
@@ -74,6 +80,55 @@ def run_task(task: TaskRequest):
         "review_result": result["review_result"],
         "final_output": result["final_output"],
     }
+
+
+# ─── Async task submission (Celery) ───────────────────────────────────────────
+
+@app.post("/tasks/submit")
+def submit_task(task: TaskRequest):
+    """
+    Submit a task asynchronously. Returns a job_id immediately.
+    The task runs in a Celery worker — poll GET /tasks/{job_id}/status for result.
+    """
+    task_id = str(uuid4())
+    db.record_submitted(task_id, task.user_id, task.request)
+    job = run_task_async.apply_async(
+        args=[task_id, task.user_id, task.request],
+        task_id=task_id,
+    )
+    return {
+        "job_id": job.id,
+        "task_id": task_id,
+        "status": "queued",
+        "poll_url": f"/tasks/{task_id}/status",
+    }
+
+
+@app.get("/tasks/{task_id}/status")
+def task_status(task_id: str):
+    """Poll for the result of an async task submission."""
+    # Check Celery backend first
+    job = celery.AsyncResult(task_id)
+    celery_state = job.state  # PENDING | STARTED | SUCCESS | FAILURE
+
+    # Also pull from Postgres for richer audit info
+    db_record = db.get_task(task_id)
+
+    if celery_state == "SUCCESS":
+        return {"task_id": task_id, "status": "completed", "result": job.result}
+    elif celery_state == "FAILURE":
+        return {"task_id": task_id, "status": "failed", "error": str(job.result)}
+    elif celery_state == "STARTED":
+        return {"task_id": task_id, "status": "running", "db": db_record}
+    else:
+        return {"task_id": task_id, "status": "queued", "db": db_record}
+
+
+@app.get("/users/{user_id}/tasks")
+def user_task_history(user_id: str):
+    """Get recent task history for a user from Postgres."""
+    tasks = db.get_user_tasks(user_id)
+    return {"user_id": user_id, "tasks": tasks}
 
 
 # ─── Human-in-the-loop endpoints ───────────────────────────────────────────────

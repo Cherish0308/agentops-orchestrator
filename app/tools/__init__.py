@@ -42,3 +42,9 @@ registry.register(ToolDefinition(
     fn=code_execute,
     rate_limit_per_minute=10,
 ))
+
+# ── MCP tools — discovered at startup from configured MCP servers ──────────────
+from app.tools.mcp_client import register_mcp_tools
+_mcp_count = register_mcp_tools()
+if _mcp_count:
+    print(f"[tools] Registered {_mcp_count} MCP tool(s)")

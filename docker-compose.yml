@@ -2,7 +2,7 @@ version: "3.9"
 
 services:
 
-  # ── Redis — short-term working memory ──────────────────────────────────────
+  # ── Redis — Celery broker + short-term working memory ──────────────────────
   redis:
     image: redis:7-alpine
     container_name: agentops_redis
@@ -16,6 +16,24 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+
+  # ── PostgreSQL — task audit log ────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: agentops_postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: agentops
+      POSTGRES_PASSWORD: agentops
+      POSTGRES_DB: agentops
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentops"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   # ── ChromaDB — long-term semantic memory ───────────────────────────────────
   chromadb:
@@ -46,8 +64,11 @@ services:
       - REDIS_PORT=6379
       - CHROMA_HOST=chromadb
       - CHROMA_PORT=8000
+      - DATABASE_URL=postgresql://agentops:agentops@postgres:5432/agentops
     depends_on:
       redis:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
       chromadb:
         condition: service_healthy
@@ -55,7 +76,30 @@ services:
       - ./workspace:/app/workspace
     command: uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload
 
-  # ── Streamlit Review UI ───────────────────────────────────────────────────
+  # ── Celery Worker — async task execution ───────────────────────────────────
+  worker:
+    build: .
+    container_name: agentops_worker
+    env_file:
+      - .env
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - CHROMA_HOST=chromadb
+      - CHROMA_PORT=8000
+      - DATABASE_URL=postgresql://agentops:agentops@postgres:5432/agentops
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      chromadb:
+        condition: service_healthy
+    volumes:
+      - ./workspace:/app/workspace
+    command: celery -A app.celery_app.celery worker --loglevel=info --concurrency=2
+
+  # ── Streamlit Review UI ────────────────────────────────────────────────────
   review_ui:
     build: .
     container_name: agentops_review_ui
@@ -71,4 +115,5 @@ services:
 
 volumes:
   redis_data:
+  postgres_data:
   chroma_data:

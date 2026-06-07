@@ -57,6 +57,16 @@ def send_chat(task_id: str, message: str):
         pass
 
 
+def fetch_user_memories(user_id: str):
+    if not user_id:
+        return {}
+    try:
+        r = requests.get(f"{API_URL}/memory/{user_id}", timeout=5)
+        return r.json()
+    except Exception:
+        return {}
+
+
 def submit_decision(task_id: str, decision: str, feedback: str,
                     modified_plan=None, human_output=None):
     payload = {"decision": decision, "feedback": feedback}
@@ -146,6 +156,25 @@ if view == "📥 Pending Reviews":
                 proposed = item.get("proposed_action")
                 if proposed:
                     st.markdown(f"**Proposed action:** `{proposed}`")
+
+                # ── Relevant memories for this user ────────────────────────
+                user_id = item.get("original_request", "")  # fallback
+                # Try to extract user_id from the review queue item
+                mem_data = fetch_user_memories(item.get("user_id", ""))
+                if mem_data.get("total_memories", 0) > 0:
+                    st.divider()
+                    st.subheader("🧠 Relevant Past Memories")
+                    st.caption(f"{mem_data['total_memories']} total memories for this user")
+                    by_type = mem_data.get("by_type", {})
+                    for mem_type, mems in by_type.items():
+                        with st.expander(f"📂 {mem_type.replace('_', ' ').title()} ({len(mems)})"):
+                            for m in mems[:3]:  # show top 3 per type
+                                importance = float(m.get("importance_score") or 0)
+                                st.markdown(
+                                    f"**{'⭐' * int(importance * 5)}** `importance={importance:.2f}`\n\n"
+                                    f"{m['content']}"
+                                )
+                                st.caption(f"Accessed {m.get('access_count', 0)} times")
 
             with col2:
                 st.subheader("💬 Chat with Agent")
