@@ -52,12 +52,12 @@ if ANTHROPIC_API_KEY:
 # ── Routing table ──────────────────────────────────────────────────────────────
 # node → (provider, model)
 ROUTING_TABLE: dict[str, tuple[str, str]] = {
-    "supervisor":     ("nvidia", "meta/llama-3.1-70b-instruct"),
-    "reviewer":       ("nvidia", "meta/llama-3.1-70b-instruct"),
-    "data_agent":     ("nvidia", "nvidia/llama-3.1-nemotron-70b-instruct"),
-    "research_agent": ("nvidia", "meta/llama-3.1-8b-instruct"),
-    "writer_agent":   ("nvidia", "mistralai/mixtral-8x22b-instruct-v0.1"),
-    "synthesizer":    ("nvidia", "mistralai/mixtral-8x22b-instruct-v0.1"),
+    "supervisor":     ("nvidia", "meta/llama-3.3-70b-instruct"),       # latest llama, best at planning
+    "reviewer":       ("nvidia", "meta/llama-3.3-70b-instruct"),       # structured JSON review
+    "data_agent":     ("nvidia", "deepseek-ai/deepseek-v4-flash"),     # great at code + data analysis
+    "research_agent": ("nvidia", "meta/llama-3.1-8b-instruct"),        # fast, good at summarising
+    "writer_agent":   ("nvidia", "mistralai/mistral-nemotron"),        # excellent writing quality
+    "synthesizer":    ("nvidia", "mistralai/mixtral-8x7b-instruct-v0.1"),  # MoE model, great synthesis
 }
 
 DEFAULT_PROVIDER = "nvidia" if NVIDIA_API_KEY else ("openai" if OPENAI_API_KEY else "anthropic")

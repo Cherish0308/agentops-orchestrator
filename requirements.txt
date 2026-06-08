@@ -5,7 +5,7 @@ python-dotenv
 langgraph
 openai
 anthropic
-duckduckgo-search
+ddgs
 redis
 chromadb
 streamlit
