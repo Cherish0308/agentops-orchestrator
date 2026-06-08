@@ -54,7 +54,7 @@ if ANTHROPIC_API_KEY:
 ROUTING_TABLE: dict[str, tuple[str, str]] = {
     "supervisor":     ("nvidia", "meta/llama-3.3-70b-instruct"),       # latest llama, best at planning
     "reviewer":       ("nvidia", "meta/llama-3.3-70b-instruct"),       # structured JSON review
-    "data_agent":     ("nvidia", "deepseek-ai/deepseek-v4-flash"),     # great at code + data analysis
+    "data_agent":     ("nvidia", "meta/llama-3.1-70b-instruct"),        # stable, good at code + data
     "research_agent": ("nvidia", "meta/llama-3.1-8b-instruct"),        # fast, good at summarising
     "writer_agent":   ("nvidia", "mistralai/mistral-nemotron"),        # excellent writing quality
     "synthesizer":    ("nvidia", "mistralai/mixtral-8x7b-instruct-v0.1"),  # MoE model, great synthesis
