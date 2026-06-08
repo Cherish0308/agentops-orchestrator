@@ -1,16 +1,18 @@
 """
-Multi-model LLM router.
+Multi-model LLM router — powered by NVIDIA NIM (free API).
 
-Agent → Model mapping:
-  supervisor   → openai  (gpt-4o-mini)   fast planning
-  reviewer     → openai  (gpt-4o-mini)   structured JSON review
-  data_agent   → openai  (gpt-4o)        code + data reasoning
-  research_agent → openai (gpt-4o-mini)  search + summarise
-  writer_agent → anthropic (claude-3-5-haiku-20241022)  long-form writing
-  synthesizer  → anthropic (claude-3-5-haiku-20241022)  final polish
-  default      → openai  (gpt-4o-mini)
+NVIDIA NIM is OpenAI-compatible, so we use the OpenAI SDK
+with a different base_url. Falls back to OpenAI/Anthropic
+if NVIDIA key is not set.
 
-Falls back to OpenAI if Anthropic key is missing.
+Agent → Model mapping (all via NVIDIA NIM free tier):
+  supervisor     → meta/llama-3.1-70b-instruct   (strong reasoning, planning)
+  reviewer       → meta/llama-3.1-70b-instruct   (structured JSON review)
+  data_agent     → nvidia/llama-3.1-nemotron-70b-instruct  (NVIDIA-tuned, great at code/data)
+  research_agent → meta/llama-3.1-8b-instruct    (fast, good at summarising)
+  writer_agent   → mistralai/mixtral-8x22b-instruct-v0.1   (excellent writing)
+  synthesizer    → mistralai/mixtral-8x22b-instruct-v0.1   (polished long-form output)
+  default        → meta/llama-3.1-70b-instruct
 """
 import time
 from contextvars import ContextVar
@@ -18,10 +20,26 @@ from typing import Optional
 
 from openai import OpenAI
 
-from app.config import ANTHROPIC_API_KEY, LLM_MODEL, OPENAI_API_KEY
+from app.config import (
+    ANTHROPIC_API_KEY,
+    NVIDIA_API_KEY,
+    NVIDIA_BASE_URL,
+    OPENAI_API_KEY,
+    LLM_MODEL,
+)
 
 # ── Clients ────────────────────────────────────────────────────────────────────
-_openai = OpenAI(api_key=OPENAI_API_KEY)
+
+# NVIDIA NIM client (OpenAI SDK, different base_url)
+_nvidia = None
+if NVIDIA_API_KEY:
+    _nvidia = OpenAI(
+        api_key=NVIDIA_API_KEY,
+        base_url=NVIDIA_BASE_URL,
+    )
+
+# Fallback clients
+_openai = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 _anthropic = None
 if ANTHROPIC_API_KEY:
@@ -29,48 +47,59 @@ if ANTHROPIC_API_KEY:
         import anthropic as _anthropic_sdk
         _anthropic = _anthropic_sdk.Anthropic(api_key=ANTHROPIC_API_KEY)
     except ImportError:
-        _anthropic = None
+        pass
 
 # ── Routing table ──────────────────────────────────────────────────────────────
-# node name → (provider, model)
+# node → (provider, model)
 ROUTING_TABLE: dict[str, tuple[str, str]] = {
-    "supervisor":     ("openai",    "gpt-4o-mini"),
-    "reviewer":       ("openai",    "gpt-4o-mini"),
-    "data_agent":     ("openai",    "gpt-4o"),
-    "research_agent": ("openai",    "gpt-4o-mini"),
-    "writer_agent":   ("anthropic", "claude-3-5-haiku-20241022"),
-    "synthesizer":    ("anthropic", "claude-3-5-haiku-20241022"),
+    "supervisor":     ("nvidia", "meta/llama-3.1-70b-instruct"),
+    "reviewer":       ("nvidia", "meta/llama-3.1-70b-instruct"),
+    "data_agent":     ("nvidia", "nvidia/llama-3.1-nemotron-70b-instruct"),
+    "research_agent": ("nvidia", "meta/llama-3.1-8b-instruct"),
+    "writer_agent":   ("nvidia", "mistralai/mixtral-8x22b-instruct-v0.1"),
+    "synthesizer":    ("nvidia", "mistralai/mixtral-8x22b-instruct-v0.1"),
 }
 
-DEFAULT_PROVIDER = "openai"
-DEFAULT_MODEL = LLM_MODEL
+DEFAULT_PROVIDER = "nvidia" if NVIDIA_API_KEY else ("openai" if OPENAI_API_KEY else "anthropic")
+DEFAULT_MODEL    = LLM_MODEL
 
-# ── Context vars (set by each agent node so the tracer knows who's calling) ───
+# ── Context vars ───────────────────────────────────────────────────────────────
 current_task_id: ContextVar[Optional[str]] = ContextVar("current_task_id", default=None)
-current_node: ContextVar[Optional[str]] = ContextVar("current_node", default=None)
+current_node:    ContextVar[Optional[str]] = ContextVar("current_node",    default=None)
 
 
 # ── Provider calls ─────────────────────────────────────────────────────────────
 
-def _call_openai(system_prompt: str, user_prompt: str, model: str) -> tuple[str, Optional[int], Optional[int]]:
-    response = _openai.chat.completions.create(
+def _call_openai_compatible(
+    client: OpenAI,
+    system_prompt: str,
+    user_prompt: str,
+    model: str,
+) -> tuple[str, Optional[int], Optional[int]]:
+    """Single function handles both NVIDIA NIM and OpenAI — same SDK, same format."""
+    response = client.chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user",   "content": user_prompt},
         ],
         temperature=0.2,
+        max_tokens=4096,
     )
     text = response.choices[0].message.content
     usage = response.usage
-    return text, (usage.prompt_tokens if usage else None), (usage.completion_tokens if usage else None)
+    return (
+        text,
+        usage.prompt_tokens     if usage else None,
+        usage.completion_tokens if usage else None,
+    )
 
 
-def _call_anthropic(system_prompt: str, user_prompt: str, model: str) -> tuple[str, Optional[int], Optional[int]]:
-    if not _anthropic:
-        # Fallback to OpenAI if Anthropic not available
-        return _call_openai(system_prompt, user_prompt, DEFAULT_MODEL)
-
+def _call_anthropic(
+    system_prompt: str,
+    user_prompt: str,
+    model: str,
+) -> tuple[str, Optional[int], Optional[int]]:
     response = _anthropic.messages.create(
         model=model,
         max_tokens=4096,
@@ -79,33 +108,58 @@ def _call_anthropic(system_prompt: str, user_prompt: str, model: str) -> tuple[s
     )
     text = response.content[0].text
     usage = response.usage
-    return text, (usage.input_tokens if usage else None), (usage.output_tokens if usage else None)
+    return (
+        text,
+        usage.input_tokens  if usage else None,
+        usage.output_tokens if usage else None,
+    )
+
+
+def _resolve_client_and_model(
+    provider: str,
+    model: str,
+) -> tuple:
+    """
+    Returns (client_or_flag, model, provider_label).
+    If the preferred provider is unavailable, cascades:
+    nvidia → openai → anthropic → error.
+    """
+    if provider == "nvidia" and _nvidia:
+        return _nvidia, model, "nvidia"
+    if provider == "openai" and _openai:
+        return _openai, model, "openai"
+    if provider == "anthropic" and _anthropic:
+        return None, model, "anthropic"   # handled separately
+
+    # Cascade fallbacks
+    if _nvidia:
+        return _nvidia, "meta/llama-3.1-70b-instruct", "nvidia"
+    if _openai:
+        return _openai, "gpt-4o-mini", "openai"
+    if _anthropic:
+        return None, "claude-3-5-haiku-20241022", "anthropic"
+
+    raise RuntimeError("No LLM provider configured. Set NVIDIA_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY.")
 
 
 # ── Public interface ───────────────────────────────────────────────────────────
 
-def call_llm(system_prompt: str, user_prompt: str, force_provider: Optional[str] = None) -> str:
+def call_llm(system_prompt: str, user_prompt: str) -> str:
     """
-    Route to the right LLM based on the current node context.
-    Optionally force a specific provider with force_provider='openai'|'anthropic'.
+    Route to the right LLM based on the current agent node.
+    Priority: NVIDIA NIM → OpenAI → Anthropic
     """
     node = current_node.get() or "default"
     provider, model = ROUTING_TABLE.get(node, (DEFAULT_PROVIDER, DEFAULT_MODEL))
 
-    if force_provider:
-        provider = force_provider
-
-    # If Anthropic isn't set up, always fall back to OpenAI
-    if provider == "anthropic" and not _anthropic:
-        provider = "openai"
-        model = DEFAULT_MODEL
+    client, resolved_model, resolved_provider = _resolve_client_and_model(provider, model)
 
     start = time.time()
 
-    if provider == "anthropic":
-        text, prompt_tokens, completion_tokens = _call_anthropic(system_prompt, user_prompt, model)
+    if resolved_provider == "anthropic":
+        text, prompt_tokens, completion_tokens = _call_anthropic(system_prompt, user_prompt, resolved_model)
     else:
-        text, prompt_tokens, completion_tokens = _call_openai(system_prompt, user_prompt, model)
+        text, prompt_tokens, completion_tokens = _call_openai_compatible(client, system_prompt, user_prompt, resolved_model)
 
     latency_ms = (time.time() - start) * 1000
 
@@ -116,7 +170,7 @@ def call_llm(system_prompt: str, user_prompt: str, force_provider: Optional[str]
         tracer.llm_call(
             task_id=task_id,
             node=node,
-            model=f"{provider}/{model}",
+            model=f"{resolved_provider}/{resolved_model}",
             prompt_preview=user_prompt,
             response_preview=text,
             latency_ms=latency_ms,
@@ -128,12 +182,13 @@ def call_llm(system_prompt: str, user_prompt: str, force_provider: Optional[str]
 
 
 def get_routing_table() -> dict:
-    """Return the current routing table for observability."""
+    """Return the active routing table — shown on GET /"""
+    active_provider = "nvidia" if _nvidia else ("openai" if _openai else "anthropic")
     return {
         node: {
             "provider": provider,
             "model": model,
-            "available": True if provider == "openai" else bool(_anthropic),
+            "active": active_provider,
         }
         for node, (provider, model) in ROUTING_TABLE.items()
     }
